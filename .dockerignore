@@ -31,3 +31,9 @@ docker-compose.yml
 !.env.example
 spotify-tokens.json
 data/
+
+# SQLite databases, journals, and live WAL files
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*

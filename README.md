@@ -286,138 +286,134 @@ A lightweight [Model Context Protocol (MCP)](https://modelcontextprotocol.io) se
 
 ## Setup
 
-Run one instance on your server behind an HTTPS reverse proxy. MCP clients use
-Streamable HTTP at `https://spotify.example.com/mcp` and send:
+The HTTP server is multi-user. Each person signs in with Spotify and grants their
+MCP client access to their own account. Better Auth provides the OAuth 2.1 MCP
+provider, JWT signing, discovery, PKCE, consent, and token refresh. Spotify tokens
+stay on the server; MCP clients receive separate, audience-bound MCP tokens.
 
-```http
-Authorization: Bearer YOUR_MCP_API_TOKEN
-```
+### Configuration
 
-The MCP token is your own secret, not a Spotify token. It grants access to all
-Spotify tools. Clients must support custom authorization headers. Change the
-server token and restart to revoke access; update each client afterwards.
-
-### Spotify app
-
-1. Sign in at https://developer.spotify.com/dashboard and create an app using
-   the Web API. Copy its client ID and client secret into your server environment.
-2. Register exactly `https://spotify.example.com/callback` as a redirect URI,
-   substituting your actual domain. Set `SPOTIFY_REDIRECT_URI` to the same value.
-3. For local development, register `http://127.0.0.1:3000/callback` instead.
-   Spotify requires HTTPS except for literal loopback IP addresses; do not use
-   `localhost`. See [Spotify redirect rules](https://developer.spotify.com/documentation/web-api/concepts/redirect_uri).
-4. Use a Spotify Premium account. Check your app's User Management settings and
-   allowlist your account if required by Development Mode.
-5. Optionally set `SPOTIFY_USER_ID` to your Spotify account ID to reject connections
-   to other accounts. This is the ID in your Spotify profile URL, not your display name.
-
-Separate apps named Spotify MCP Dev and Spotify MCP Prod are recommended to
-isolate credentials and revocation, but one app can have both redirect URIs.
-Hosting on Hetzner does not require Spotify extended quota mode: a personal
-single-user deployment can remain in Development Mode, subject to Spotify's
-[current eligibility and limits](https://developer.spotify.com/documentation/web-api/concepts/quota-modes).
-Use different MCP tokens and token files/volumes for each environment regardless.
-
-### Hetzner / Docker
-
-Copy `.env.example` to `.env`, fill in the Spotify values, and generate a secret:
-
-```bash
-openssl rand -hex 32
-```
-
-Set that result as `MCP_API_TOKEN`, then run:
-
-```bash
-docker compose up -d --build
-```
-
-Configure your reverse proxy to forward your HTTPS domain to
-`127.0.0.1:3000`, including the Authorization header and streaming responses.
-If your proxy runs in another container, join a shared Docker network and forward
-to `spotify-mcp:3000` instead. Only the HTTPS proxy should be publicly exposed.
-The `/health` endpoint is a process health check, not a Spotify connectivity check.
-
-Open `https://spotify.example.com/`, enter your MCP token in the password field,
-and click Connect Spotify. Authorize Spotify in the browser. No `npm run auth`
-or local callback server is needed. The browser sends the secret in a POST body,
-never in the URL; it is not stored in a browser session. Login state expires after
-10 minutes and is discarded on server restart. Start again if interrupted.
-
-Spotify access/refresh tokens are saved in `/app/data/spotify-tokens.json` on the
-Docker volume, with owner-only permissions and atomic replacement. Client ID and
-secret come exclusively from environment variables; `spotify-config.json` is no
-longer read. Tokens refresh automatically. Reconnect through the website if
-Spotify revokes authorization. Run one replica against the token file.
-Do not delete the volume unless you intend to reconnect Spotify.
-
-### Dokploy CI/CD
-
-The GitHub Actions workflow runs lint, type checking, and tests before building
-and pushing a `linux/amd64` image to `ghcr.io/senzmaki/spotify-mcp-server` with
-`latest` and commit tags. Pushes to `main` and manual workflow runs on `main`
-then trigger Dokploy through `SenZmaKi/dokploy-sentry`, which waits for deployment
-completion. Pull requests run checks only.
-
-Repository Actions secrets:
-
-- `DOKPLOY_URL`: `https://dokploy.phidel.dev`
-- `DOKPLOY_API_KEY`: configured directly in GitHub Secrets, never in this repo
-- `DOKPLOY_APP_ID`: the Spotify MCP `server` application's ID
-
-The configured Dokploy project is **Spotify MCP**, environment **production**,
-application **server**. It pulls `ghcr.io/senzmaki/spotify-mcp-server:latest`, runs
-one replica, mounts the `spotify-mcp-data` volume at `/app/data`, and checks
-`/health`. Its HTTPS domain is `spotify-mcp.phidel.dev` on container port 3000.
-Dokploy routes directly to the application; it does not use the local Compose
-file or its host port mapping.
-
-Before the first deployment:
-
-1. Point DNS for `spotify-mcp.phidel.dev` to your Dokploy server and remove
-   conflicting A/AAAA records. Dokploy manages the Let's Encrypt certificate.
-2. In the application's Environment settings, fill in `SPOTIFY_CLIENT_ID` and
-   `SPOTIFY_CLIENT_SECRET`. The callback is already configured as
-   `https://spotify-mcp.phidel.dev/callback`; register that exact URI with Spotify.
-   Optionally fill in `SPOTIFY_USER_ID`.
-3. `MCP_API_TOKEN` was generated directly in Dokploy. Retrieve it from the
-   application's Environment settings for the website and MCP client settings.
-4. Ensure the GHCR package is public after its first publication, or configure
-   Dokploy's Docker provider with registry credentials granting `read:packages`.
-   A public GitHub repository does not automatically make a new GHCR package public.
-5. Push the changes to `main` to run CI/CD. If the initial deployment cannot pull
-   the image, fix package access and rerun the deployment job. Open the website
-   and connect Spotify once the application is running.
-
-Spotify and MCP credentials belong in the Dokploy runtime environment, not in
-Docker build arguments or GitHub workflow source. Preserve the token volume
-across redeployments.
-
-### Local development
-
-Use a separate `.env.dev` with the same variables, setting:
+Copy `.env.example` to `.env` and set:
 
 ```dotenv
+MCP_TRANSPORT=http
 MCP_HTTP_HOST=127.0.0.1
-SPOTIFY_REDIRECT_URI=http://127.0.0.1:3000/callback
-SPOTIFY_TOKEN_FILE=./data/dev-tokens.json
+MCP_HTTP_PORT=3000
+BETTER_AUTH_URL=https://spotify-mcp.phidel.dev
+BETTER_AUTH_SECRET=GENERATE_A_RANDOM_SECRET_OF_AT_LEAST_32_CHARACTERS
+SPOTIFY_CLIENT_ID=YOUR_SPOTIFY_APP_CLIENT_ID
+SPOTIFY_CLIENT_SECRET=YOUR_SPOTIFY_APP_CLIENT_SECRET
+DATABASE_PATH=./data/spotify.sqlite
 ```
+
+Generate `BETTER_AUTH_SECRET` with `openssl rand -hex 32`. Preserve it across
+restarts and deployments: it encrypts stored Spotify credentials and protects
+sessions. Use the externally reachable HTTPS origin for `BETTER_AUTH_URL`, with
+no path or trailing components. Forward that domain to container port 3000.
+The public origin is read from configuration rather than forwarded headers.
+
+In the Spotify Developer Dashboard, register this exact redirect URI:
+
+```text
+https://spotify-mcp.phidel.dev/api/auth/callback/spotify
+```
+
+For local development set `BETTER_AUTH_URL=http://127.0.0.1:3000` and register
+`http://127.0.0.1:3000/api/auth/callback/spotify` instead. Access the site through
+that same origin. The Spotify app's own access restrictions still apply to
+people who sign in; removing the server's old account allowlist does not change
+Spotify's app permissions or approval requirements.
+
+### Connect ChatGPT or another MCP client
+
+1. Add `https://spotify-mcp.phidel.dev/mcp` as the server URL.
+2. Select OAuth and Client ID Metadata Document (CIMD) registration. Discovery
+   advertises CIMD and PKCE S256; no manually entered OAuth client secret is needed.
+3. Request `openid offline_access spotify:tools` if the client asks for scopes.
+4. Sign in with Spotify, then approve the client's consent screen.
+
+CIMD clients must serve valid public HTTPS metadata documents. The configured
+fetch transport rejects private network addresses and redirects. Dynamic Client
+Registration is disabled. Other clients can be created by a signed-in user with
+Better Auth's `/api/auth/oauth2/create-client` API; the returned client credentials
+belong to this authorization server, not to the Spotify app.
+
+Discovery is public at `/.well-known/oauth-protected-resource` (also `/mcp`
+suffixed) and `/.well-known/oauth-authorization-server/api/auth`. The issuer is
+`BETTER_AUTH_URL/api/auth`, and the protected resource is `BETTER_AUTH_URL/mcp`.
+HTTP requires MCP protocol revision `2026-07-28`; older session-based HTTP clients
+are rejected. The existing tool surface is unchanged.
+
+### SQLite storage and account isolation
+
+Users, browser sessions, Spotify accounts, signing keys, OAuth clients, consent,
+authorization state, refresh grants, and rate limits persist in SQLite using
+Node's built-in SQLite driver. Startup applies Better Auth's additive schema
+migrations before accepting requests. Spotify access and refresh tokens are
+encrypted using `BETTER_AUTH_SECRET`; the database file is created with mode 0600.
+The database uses WAL mode, foreign keys, and a five-second busy timeout.
+
+Every MCP request validates token signature, issuer, resource audience, expiry,
+and the `spotify:tools` scope. Only the verified subject selects the user's
+Spotify account. User IDs supplied in tool arguments cannot select another
+account. SDK clients are created per operation and token refreshes are serialized
+per user within the process. No shared Spotify credentials are used as fallback.
+
+MCP access tokens expire after 15 minutes. OAuth refresh grants rotate through
+Better Auth. Revoking a refresh grant stops subsequent refreshes; an already
+issued JWT may remain usable until its expiry. Signing out ends the browser
+session; it is not a revoke-all-clients action. A missing/deleted Spotify account
+fails that user's tool calls without affecting other accounts.
+
+Run one replica against a persistent local disk volume at `/app/data`; do not
+share this SQLite file between containers or hosts. Back up SQLite with an
+online backup tool, or stop the server and back up the entire data directory
+(including any WAL), together with the stable auth secret. Copying only a live
+`.sqlite` file can lose committed writes in its WAL.
+
+### Migrate from the shared-token server
+
+The old `MCP_API_TOKEN`, `MCP_AUTH`, `SPOTIFY_USER_ID`, `SPOTIFY_REDIRECT_URI`,
+`SPOTIFY_TOKEN_FILE`, and `SPOTIFY_AUTHORIZATION_SERVERS` settings are no longer
+used. Update the runtime environment and Spotify callback URI before deploying.
+The old `spotify-tokens.json` is left untouched and is never imported or served:
+it has no tenant ownership information. Each user must sign in again. Existing
+static-token MCP connections must be recreated using OAuth.
+
+### Run locally or in Docker
 
 ```bash
 npm ci
 npm run build
-node --env-file=.env.dev build/index.js
+node --env-file=.env build/index.js
 ```
 
-Open `http://127.0.0.1:3000/` to connect. Environment files are loaded by Node's
-`--env-file` flag or Docker Compose, not automatically by the application.
-Legacy `MCP_AUTH=spotify` client-managed Spotify authentication remains available,
-but cannot be combined with `MCP_API_TOKEN`. The Docker default is token mode.
-Unauthenticated HTTP is restricted to loopback bindings.
+Or run `docker compose up --build -d`. The Compose file binds port 3000 to the
+host's loopback interface and mounts the `spotify-data` volume at `/app/data`.
+Use an HTTPS reverse proxy for public access. `/health` remains unauthenticated
+for container health checks. Environment files are loaded by Node's `--env-file`
+flag or Docker Compose, not implicitly by the application.
+
+For Dokploy, keep the existing domain and data volume, replace the old runtime
+settings with the new variables above, and point the domain to container port
+3000. The existing CI/CD pipeline builds the image and triggers Dokploy after
+checks pass. This code migration does not update a running deployment's secrets
+or Spotify dashboard configuration.
+
+### Local stdio clients
+
+Stdio remains available when `MCP_TRANSPORT` is unset. For Spotify operations,
+configure the same database, Better Auth settings and Spotify app credentials,
+then set `SPOTIFY_LOCAL_USER_ID` to an existing Better Auth user ID after signing
+in through the HTTP site. This selector is only for a trusted local process; it
+is never read from HTTP requests. An unset or unknown user ID fails instead of
+choosing the first account in the database. Avoid running simultaneous HTTP and
+stdio processes against the same account because refresh serialization is local
+to each process; use HTTP OAuth clients for concurrent access.
 
 ## Development
 
-The server uses MCP TypeScript SDK v2 and Zod 4, serving protocol revision `2026-07-28` while retaining compatibility with legacy MCP clients. Only the latest Node.js Current release is supported (minimum v26.8.1). CI follows the latest Current release. Install the locked dependencies with `npm ci`.
+The server uses MCP TypeScript SDK v2 and Zod 4, serving protocol revision `2026-07-28` with legacy protocol compatibility retained only for stdio. Only the latest Node.js Current release is supported (minimum v26.8.1). CI follows the latest Current release. Install the locked dependencies with `npm ci`.
 
 ```bash
 npm run lint

@@ -20,9 +20,13 @@
   "author": "Marcel Marais",
   "description": "A Model Context Protocol server for Spotify integration",
   "dependencies": {
+    "@better-auth/cimd": "^1.7.10",
+    "@better-auth/mcp": "^1.7.10",
+    "@better-auth/oauth-provider": "^1.7.10",
     "@modelcontextprotocol/node": "^2.1.1",
     "@modelcontextprotocol/server": "^2.3.1",
     "@spotify/web-api-ts-sdk": "^1.2.0",
+    "better-auth": "^1.7.10",
     "zod": "^4.6.5"
   },
   "devDependencies": {

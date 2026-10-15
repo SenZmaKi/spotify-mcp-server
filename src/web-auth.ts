@@ -1,155 +1,119 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import type { IncomingMessage, ServerResponse } from 'node:http';
-import {
-  exchangeCodeForToken,
-  loadSpotifyConfig,
-  SPOTIFY_SCOPES,
-  saveSpotifyConfig,
-} from './utils.js';
+import { verifyOAuthQueryParams } from '@better-auth/oauth-provider';
+import type { AuthRuntime } from './auth.js';
 
-export function matchesSecret(value: string, secret: string): boolean {
-  const hash = (text: string) => createHash('sha256').update(text).digest();
-  return timingSafeEqual(hash(value), hash(secret));
+function escapeHtml(value: string): string {
+  return value.replace(
+    /[&<>"']/g,
+    (char) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[
+        char
+      ] ?? char,
+  );
 }
 
-export function createWebAuth(secret: string) {
-  const config = loadSpotifyConfig();
-  const redirect = new URL(config.redirectUri);
-  if (
-    redirect.username ||
-    redirect.password ||
-    redirect.pathname !== '/callback' ||
-    redirect.search ||
-    redirect.hash ||
-    (redirect.protocol !== 'https:' &&
-      !(
-        redirect.protocol === 'http:' &&
-        ['127.0.0.1', '[::1]'].includes(redirect.hostname)
-      ))
-  ) {
-    throw new Error(
-      'SPOTIFY_REDIRECT_URI must be HTTPS (or loopback HTTP), with path /callback and no query or fragment.',
-    );
+function page(title: string, content: string): Response {
+  return new Response(
+    `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} · Spotify MCP</title><link rel="stylesheet" href="/auth.css"><script src="/auth.js" defer></script><main><p class="brand">Spotify MCP</p><h1>${title}</h1>${content}<p id="error" role="alert"></p></main></html>`,
+    {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    },
+  );
+}
+
+const script = `
+const error = document.querySelector('#error');
+async function send(path, body) {
+  const response = await fetch('/api/auth' + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin', body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || data.error_description || 'Could not complete the request. Try again.');
+  return data;
+}
+document.querySelector('form')?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.submitter;
+  const form = event.currentTarget;
+  const oauthQuery = form.elements.oauth_query?.value;
+  error.textContent = '';
+  for (const item of form.querySelectorAll('button')) item.disabled = true;
+  try {
+    let data;
+    if (form.dataset.action === 'consent') {
+      data = await send('/oauth2/consent', { accept: button.value === 'accept', oauth_query: oauthQuery });
+    } else if (form.dataset.action === 'sign-out') {
+      await send('/sign-out', {});
+      location.assign('/'); return;
+    } else {
+      data = await send('/sign-in/social', { provider: 'spotify', callbackURL: '/', errorCallbackURL: '/sign-in?error=spotify', ...(oauthQuery ? { oauth_query: oauthQuery } : {}) });
+    }
+    const destination = data.url || data.redirect_uri;
+    if (!destination) throw new Error('The authorization response did not include a redirect. Start again.');
+    location.assign(destination);
+  } catch (failure) {
+    error.textContent = failure.message;
+    for (const item of form.querySelectorAll('button')) item.disabled = false;
   }
-  const pending = new Map<string, number>();
-  return async (
-    req: IncomingMessage,
-    res: ServerResponse,
-    url: URL,
-  ): Promise<boolean> => {
-    if (!['/', '/connect', '/callback'].includes(url.pathname)) return false;
-    res.setHeader('Cache-Control', 'no-store');
-    // Preserve the same-origin form Origin header in Firefox while keeping
-    // callback codes and state out of cross-origin referrers.
-    res.setHeader('Referrer-Policy', 'same-origin');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader(
-      'Content-Security-Policy',
-      "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-    );
-    if (url.pathname === '/' && req.method === 'GET') {
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end(
-        '<!doctype html><html lang="en"><title>Spotify MCP</title><h1>Connect Spotify</h1><p>Enter your MCP token to connect or reconnect your account.</p><form method="post" action="/connect"><label>MCP token <input name="token" type="password" required autocomplete="off"></label><button>Connect Spotify</button></form></html>',
-      );
-      return true;
-    }
-    if (url.pathname === '/connect' && req.method === 'POST') {
-      if (req.headers.origin && req.headers.origin !== redirect.origin) {
-        res.writeHead(403).end('Invalid origin');
-        return true;
-      }
-      let body = '';
-      for await (const chunk of req) {
-        body += chunk;
-        if (body.length > 4096) {
-          res.writeHead(413).end();
-          return true;
-        }
-      }
-      if (
-        !matchesSecret(new URLSearchParams(body).get('token') ?? '', secret)
-      ) {
-        res.writeHead(401).end('Unauthorized');
-        return true;
-      }
-      for (const [state, expires] of pending)
-        if (expires <= Date.now()) pending.delete(state);
-      if (pending.size >= 100) {
-        res.writeHead(429).end('Try again later');
-        return true;
-      }
-      const state = randomBytes(32).toString('hex');
-      pending.set(state, Date.now() + 600_000);
-      res.setHeader(
-        'Set-Cookie',
-        `spotify_state=${state}; HttpOnly; SameSite=Lax; Path=/callback; Max-Age=600${redirect.protocol === 'https:' ? '; Secure' : ''}`,
-      );
-      const params = new URLSearchParams({
-        client_id: config.clientId,
-        response_type: 'code',
-        redirect_uri: config.redirectUri,
-        scope: SPOTIFY_SCOPES.join(' '),
-        state,
+});
+`;
+
+export function createWebAuth(runtime: AuthRuntime) {
+  return async (request: Request): Promise<Response | undefined> => {
+    const url = new URL(request.url);
+    if (request.method !== 'GET') return;
+    if (url.pathname === '/auth.js')
+      return new Response(script, {
+        headers: { 'Content-Type': 'text/javascript; charset=utf-8' },
       });
-      res
-        .writeHead(303, {
-          Location: `https://accounts.spotify.com/authorize?${params}`,
-        })
-        .end();
-      return true;
-    }
-    if (url.pathname === '/callback' && req.method === 'GET') {
-      const state = url.searchParams.get('state') ?? '';
-      const cookie = req.headers.cookie
-        ?.split(';')
-        .map((s) => s.trim())
-        .find((s) => s.startsWith('spotify_state='))
-        ?.slice(14);
-      const expires = pending.get(state) ?? 0;
-      if (!state || cookie !== state || expires <= Date.now()) {
-        res.writeHead(400).end('Invalid or expired login. Start again.');
-        return true;
-      }
-      pending.delete(state);
-      res.setHeader(
-        'Set-Cookie',
-        'spotify_state=; HttpOnly; SameSite=Lax; Path=/callback; Max-Age=0',
+    if (url.pathname === '/auth.css')
+      return new Response(
+        `:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#111;color:#eee}body{margin:0;padding:24px}main{max-width:460px;margin:12vh auto;padding:32px;border:1px solid #333;border-radius:16px;background:#191919}h1{font-size:28px}.brand{color:#1ed760;font-weight:700}p{line-height:1.6}button{padding:12px 20px;border:0;border-radius:24px;background:#1ed760;color:#111;font:inherit;font-weight:650;cursor:pointer;margin:8px 8px 0 0}button[value=deny]{background:#333;color:#eee}button:disabled{opacity:.5}#error{color:#ffaaa0;overflow-wrap:anywhere}code{overflow-wrap:anywhere}`,
+        { headers: { 'Content-Type': 'text/css; charset=utf-8' } },
       );
-      const code = url.searchParams.get('code');
-      if (!code || url.searchParams.has('error')) {
-        res.writeHead(400).end('Spotify authorization denied.');
-        return true;
-      }
-      try {
-        const tokens = await exchangeCodeForToken(code, config);
-        if (process.env.SPOTIFY_USER_ID) {
-          const response = await fetch('https://api.spotify.com/v1/me', {
-            headers: { Authorization: `Bearer ${tokens.access_token}` },
-          });
-          if (
-            !response.ok ||
-            (await response.json()).id !== process.env.SPOTIFY_USER_ID
-          ) {
-            res.writeHead(403).end('Spotify account is not allowed.');
-            return true;
-          }
-        }
-        saveSpotifyConfig({
-          ...config,
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token,
-          expiresAt: Date.now() + tokens.expires_in * 1000,
-        });
-        res.end(
-          'Spotify connected. You can close this page and use your MCP client.',
-        );
-      } catch {
-        res.writeHead(502).end('Could not connect Spotify. Start again.');
-      }
-      return true;
+    if (!['/', '/sign-in', '/consent'].includes(url.pathname)) return;
+    const query = url.search.slice(1);
+    const oauthQuery = url.searchParams.has('sig') ? query : undefined;
+    if (
+      (oauthQuery || url.pathname === '/consent') &&
+      !(await verifyOAuthQueryParams(
+        query,
+        (
+          await runtime.auth.$context
+        ).secret,
+      ))
+    ) {
+      return new Response(
+        'Invalid or expired authorization request. Start again from your MCP client.',
+        { status: 400 },
+      );
     }
-    res.writeHead(405).end();
-    return true;
+    const session = await runtime.auth.api.getSession({
+      headers: request.headers,
+    });
+    const hidden = oauthQuery
+      ? `<input type="hidden" name="oauth_query" value="${escapeHtml(oauthQuery)}">`
+      : '';
+    if (url.pathname === '/consent') {
+      if (!session)
+        return new Response(
+          'Your session expired. Start again from your MCP client.',
+          { status: 401 },
+        );
+      return page(
+        'Allow Spotify access?',
+        `<p>Signed in as <strong>${escapeHtml(session.user.name)}</strong>.</p><p>Client <code>${escapeHtml(url.searchParams.get('client_id') || '')}</code> is requesting:</p><p><code>${escapeHtml(url.searchParams.get('scope') || '')}</code></p><p>This permits reading your Spotify library and listening activity, controlling playback, and changing your playlists and saved music.</p><form data-action="consent">${hidden}<button value="accept">Allow access</button><button value="deny">Deny</button></form>`,
+      );
+    }
+    if (session && url.pathname === '/') {
+      return page(
+        'Spotify connected',
+        `<p>Signed in as <strong>${escapeHtml(session.user.name)}</strong>. Connect your MCP client to <code>${escapeHtml(runtime.resource)}</code> using OAuth.</p><form data-action="sign-out"><button>Sign out</button></form>`,
+      );
+    }
+    return page(
+      'Connect your Spotify',
+      `<p>Sign in to let your MCP client use your Spotify account. Your connection belongs only to you.</p>${url.searchParams.has('error') ? '<p>Spotify sign-in failed. Please try again.</p>' : ''}<form data-action="sign-in">${hidden}<button>Continue with Spotify</button></form>`,
+    );
   };
 }

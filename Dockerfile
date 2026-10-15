@@ -20,8 +20,7 @@ RUN npm prune --omit=dev
 
 # ---- Runtime stage ---------------------------------------------------------
 FROM node:26-alpine
-# Run as an unprivileged user; the server needs no filesystem or host access
-# beyond its own working directory in OAuth mode.
+# Run as an unprivileged user. SQLite and its WAL live in /app/data.
 RUN addgroup -g 1001 mcp && adduser -u 1001 -G mcp -s /bin/sh -D mcp
 WORKDIR /app
 ENV NODE_ENV=production
@@ -38,6 +37,6 @@ EXPOSE 3000
 ENV MCP_TRANSPORT=http \
     MCP_HTTP_HOST=0.0.0.0 \
     MCP_HTTP_PORT=3000 \
-    MCP_AUTH=token
+    DATABASE_PATH=/app/data/spotify.sqlite
 
 CMD ["node", "build/index.js"]

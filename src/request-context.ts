@@ -1,21 +1,30 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-/**
- * Per-request Spotify access token, set by the HTTP transport in auth mode
- * (MCP_AUTH=spotify). The Bearer token sent by the MCP client IS a valid
- * Spotify access token: the client (e.g. MCPHub) performs the Spotify OAuth
- * flow itself, so this process never needs the client secret or a
- * refresh token.
- *
- * stdio mode (no auth layer) leaves the storage empty; code falls back to
- * the environment configuration and persisted Spotify token flow.
- */
-const tokenStorage = new AsyncLocalStorage<string | null>();
+// Only the transport supplies this resolver, after verifying the MCP subject.
+// There is deliberately no shared-token or environment fallback.
+const accounts = new AsyncLocalStorage<() => Promise<string>>();
 
-export function withSpotifyRequestToken<T>(token: string, fn: () => T): T {
-  return tokenStorage.run(token, fn);
+export function withSpotifyAccount<T>(
+  resolveToken: () => Promise<string>,
+  fn: () => T,
+): T {
+  return accounts.run(resolveToken, fn);
 }
 
-export function getSpotifyRequestToken(): string | null {
-  return tokenStorage.getStore() ?? null;
+export async function getSpotifyAccessToken(): Promise<string> {
+  const resolve = accounts.getStore();
+  if (!resolve)
+    throw new Error('Sign in with Spotify before using Spotify tools.');
+  return resolve();
+}
+
+// Stdio events run in the sender's async context. Capture the account selected
+// when this server instance is created and restore it around each tool callback.
+export function bindSpotifyAccount<Args extends unknown[], Result>(
+  handler: (...args: Args) => Result,
+): (...args: Args) => Result {
+  const resolve = accounts.getStore();
+  return resolve
+    ? (...args) => withSpotifyAccount(resolve, () => handler(...args))
+    : handler;
 }

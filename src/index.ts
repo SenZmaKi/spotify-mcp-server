@@ -1,49 +1,37 @@
 import type { AddressInfo } from 'node:net';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
-import {
-  authOptionsFromEnv,
-  formatHost,
-  httpOptionsFromEnv,
-  serveHttp,
-} from './http.js';
+import { formatHost, httpOptionsFromEnv, serveHttp } from './http.js';
+import { withSpotifyAccount } from './request-context.js';
 import { createServer } from './server.js';
-import { createSpotifyApi } from './utils.js';
 
-// Proactively refresh the Spotify token every 45 minutes so it never
-// expires mid-session (tokens last 60 minutes; this keeps a safe buffer).
-// Skipped in OAuth mode: tokens arrive fresh from the MCP client per
-// request, and no local refresh token exists.
-if (!authOptionsFromEnv()) {
-  setInterval(
-    async () => {
-      try {
-        await createSpotifyApi();
-      } catch {
-        // Errors will surface on the next tool call; nothing actionable here.
-      }
-    },
-    45 * 60 * 1000,
-  ).unref();
-}
 const http = httpOptionsFromEnv();
 if (http) {
-  // Auth mode (MCP_AUTH=spotify): MCP clients (e.g. MCPHub) perform the
-  // Spotify OAuth flow themselves and present the resulting access token as
-  // Bearer. The token is used per request and never written to
-  // the Spotify token file. serveHttp resolves the protected-resource address
-  // once the socket binds (bound port) so metadata and 401 challenges agree.
-  const auth = authOptionsFromEnv();
-  const server = await serveHttp(createServer, http, auth);
+  const server = await serveHttp(createServer, http);
   const { port } = server.address() as AddressInfo;
   console.error(
-    `Spotify MCP server listening on http://${formatHost(http.host)}:${port}/mcp${
-      auth ? ' (OAuth: Bearer tokens required)' : ''
-    }`,
+    `Spotify MCP listening on http://${formatHost(http.host)}:${port}/mcp (OAuth required)`,
   );
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(signal, () => server.close());
+  }
 } else {
-  serveStdio(createServer, {
-    onerror(error) {
-      console.error('MCP transport error:', error);
+  // stdio is a local trusted process. Account selection must be explicit;
+  // never pick the first user's Spotify credentials from a shared database.
+  let runtime:
+    | Promise<Awaited<ReturnType<typeof import('./auth.js').createAuth>>>
+    | undefined;
+  const resolveToken = async () => {
+    const userId = process.env.SPOTIFY_LOCAL_USER_ID;
+    if (!userId)
+      throw new Error(
+        'Set SPOTIFY_LOCAL_USER_ID to a signed-in Better Auth user ID for stdio.',
+      );
+    runtime ??= import('./auth.js').then(({ createAuth }) => createAuth());
+    return (await runtime).spotifyToken(userId);
+  };
+  serveStdio(() => withSpotifyAccount(resolveToken, createServer), {
+    onerror() {
+      console.error('MCP transport error');
     },
   });
 }

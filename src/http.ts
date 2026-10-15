@@ -5,22 +5,17 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { BlockList, isIPv6 } from 'node:net';
-import {
-  hostHeaderValidation,
-  originValidation,
-  toNodeHandler,
-} from '@modelcontextprotocol/node';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { requireMcpAuth } from '@better-auth/mcp';
+import { hostHeaderValidation, toWebRequest } from '@modelcontextprotocol/node';
 import {
   createMcpHandler,
   type McpServerFactory,
 } from '@modelcontextprotocol/server';
-import { withSpotifyRequestToken } from './request-context.js';
-import {
-  SPOTIFY_SCOPES,
-  setSpotifyTokenRejectedHook,
-  validateSpotifyToken,
-} from './utils.js';
-import { createWebAuth, matchesSecret } from './web-auth.js';
+import { type AuthRuntime, createAuth } from './auth.js';
+import { withSpotifyAccount } from './request-context.js';
+import { createWebAuth } from './web-auth.js';
 
 export interface HttpOptions {
   host: string;
@@ -58,218 +53,171 @@ export function formatHost(address: string): string {
   return isIPv6(address) ? `[${address}]` : address;
 }
 
-function loopbackGuards(configuredHost: string, address: string): Guard[] {
-  const hostnames = ['localhost', '127.0.0.1', '[::1]'];
-  for (const name of [configuredHost, address]) {
-    const hostname = URL.parse(`http://${formatHost(name)}`)?.hostname;
-    if (hostname) hostnames.push(hostname);
-  }
-  return [hostHeaderValidation(hostnames), originValidation(hostnames)];
+// The SDK's generic Node adapter flattens repeated Set-Cookie headers. OAuth
+// needs every state/session cookie, so preserve them explicitly at this boundary.
+export function toNodeAppHandler(
+  fetchHandler: (request: Request) => Promise<Response>,
+) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const controller = new AbortController();
+    res.once('close', () => {
+      if (!res.writableFinished) controller.abort();
+    });
+    try {
+      const request = await toWebRequest(req, undefined, {
+        signal: controller.signal,
+        maxRequestBodySize: 64 * 1024,
+      });
+      const response = await fetchHandler(request);
+      for (const [name, value] of response.headers) {
+        if (name !== 'set-cookie') res.setHeader(name, value);
+      }
+      const cookies = response.headers.getSetCookie();
+      if (cookies.length) res.setHeader('Set-Cookie', cookies);
+      res.writeHead(response.status);
+      if (!response.body) res.end();
+      else
+        await pipeline(
+          Readable.fromWeb(
+            response.body as import('node:stream/web').ReadableStream,
+          ),
+          res,
+        );
+    } catch (error) {
+      if (res.destroyed) return;
+      if (!res.headersSent)
+        res.writeHead(
+          (error as { status?: number }).status === 413 ? 413 : 500,
+        );
+      res.end();
+      if ((error as { status?: number }).status !== 413)
+        console.error('HTTP request failed');
+    }
+  };
 }
 
-interface AuthOptions {
-  authorizationServers: string[];
-  /**
-   * The resource URL as explicitly set via SPOTIFY_RESOURCE_URL, if any.
-   * When present it is the canonical identifier the MCP client uses to reach
-   * this server (e.g. a Docker service name or a reverse-proxy public URL)
-   * and must not be replaced by the local bind address (e.g. 0.0.0.0 in
-   * Docker).
-   */
-  explicitResourceUrl?: string;
-}
-
-export function authOptionsFromEnv(
-  env: NodeJS.ProcessEnv = process.env,
-): AuthOptions | undefined {
-  if (env.MCP_AUTH !== 'spotify') return undefined;
-  return {
-    authorizationServers: env.SPOTIFY_AUTHORIZATION_SERVERS?.split(',').filter(
-      Boolean,
-    ) ?? ['https://accounts.spotify.com'],
-    ...(env.SPOTIFY_RESOURCE_URL
-      ? { explicitResourceUrl: env.SPOTIFY_RESOURCE_URL }
-      : {}),
+export function createHttpHandler(
+  factory: McpServerFactory,
+  runtime: AuthRuntime,
+) {
+  const onerror = () => console.error('MCP HTTP request failed');
+  const mcpHandler = createMcpHandler(factory, { onerror, legacy: 'reject' });
+  const protectedMcp = requireMcpAuth(
+    runtime.auth,
+    async (request, claims) => {
+      if (typeof claims.sub !== 'string' || !claims.sub)
+        return new Response('User authorization required', { status: 401 });
+      const userId = claims.sub;
+      // Never accept a user ID, Spotify token, or account selector from MCP arguments.
+      const context = await runtime.auth.$context;
+      if (!(await context.internalAdapter.findUserById(userId)))
+        return new Response('User no longer exists', { status: 401 });
+      return withSpotifyAccount(
+        () => runtime.spotifyToken(userId),
+        () => mcpHandler.fetch(request),
+      );
+    },
+    { resource: runtime.resource, requiredScopes: ['spotify:tools'] },
+  );
+  const web = createWebAuth(runtime);
+  return async (input: Request): Promise<Response> => {
+    const incoming = new URL(input.url);
+    // Public origin is configuration, never an untrusted forwarded/Host header.
+    const request = new Request(
+      `${runtime.baseURL}${incoming.pathname}${incoming.search}`,
+      input,
+    );
+    const url = new URL(request.url);
+    // Browser session mutations must originate here. OAuth token endpoints are
+    // called by independent clients and authenticate with their OAuth credentials.
+    const clientEndpoints = new Set([
+      '/api/auth/oauth2/token',
+      '/api/auth/oauth2/introspect',
+      '/api/auth/oauth2/revoke',
+    ]);
+    if (
+      request.method === 'POST' &&
+      url.pathname.startsWith('/api/auth/') &&
+      !clientEndpoints.has(url.pathname) &&
+      request.headers.get('origin') !== runtime.baseURL
+    ) {
+      return new Response('Invalid origin', { status: 403 });
+    }
+    let response: Response;
+    if (url.pathname === '/health' && request.method === 'GET')
+      response = new Response('ok');
+    else if (url.pathname === '/mcp') response = await protectedMcp(request);
+    else if (
+      url.pathname.startsWith('/api/auth/') ||
+      url.pathname.startsWith('/.well-known/')
+    )
+      response = await runtime.auth.handler(request);
+    else
+      response =
+        (await web(request)) ?? new Response('Not found', { status: 404 });
+    response.headers.set('Cache-Control', 'no-store');
+    response.headers.set('Referrer-Policy', 'no-referrer');
+    response.headers.set('X-Content-Type-Options', 'nosniff');
+    response.headers.set(
+      'Content-Security-Policy',
+      "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    );
+    return response;
   };
 }
 
 export async function serveHttp(
   factory: McpServerFactory,
   { host, port }: HttpOptions,
-  auth?: AuthOptions,
+  suppliedRuntime?: AuthRuntime,
 ): Promise<Server> {
-  const apiToken = process.env.MCP_API_TOKEN;
-  if (process.env.MCP_AUTH === 'token' && !apiToken)
-    throw new Error('MCP_API_TOKEN is required.');
-  if (apiToken && auth)
-    throw new Error('Choose MCP_AUTH=token or MCP_AUTH=spotify, not both.');
-  if (
-    !(apiToken || auth || isLoopbackAddress(host)) &&
-    host.toLowerCase().replace(/\.$/, '') !== 'localhost'
-  ) {
-    throw new Error('Remote HTTP requires MCP_API_TOKEN or MCP_AUTH=spotify.');
-  }
-  if (apiToken && apiToken.length < 32)
-    throw new Error('MCP_API_TOKEN must contain at least 32 characters.');
-  const webAuth = apiToken ? createWebAuth(apiToken) : undefined;
-  const onerror = (error: Error) => console.error('MCP HTTP error:', error);
-  const handle = toNodeHandler(createMcpHandler(factory, { onerror }), {
-    onerror,
-  });
-  let guards: Guard[] = [];
-
-  // The resource address is resolved exactly once, in the `listening` handler
-  // below, now that the socket has bound. The metadata document and every 401
-  // challenge reuse this single value, so they can never advertise different
-  // addresses. The port comes from the bound socket, so MCP_HTTP_PORT=0 (let
-  // the OS choose) is handled correctly instead of leaking a literal "0".
-  let resourceUrl = '';
-  const resourceMetadataUrl = () =>
-    `${resourceUrl}/.well-known/oauth-protected-resource`;
-
+  const runtime = suppliedRuntime ?? (await createAuth());
+  const handle = toNodeAppHandler(createHttpHandler(factory, runtime));
+  const publicHostname = new URL(runtime.baseURL).hostname;
+  let guards: Guard[] = [hostHeaderValidation([publicHostname])];
   const server = createHttpServer((req, res) => {
-    void route(req, res).catch(() => {
-      if (!res.headersSent) res.writeHead(500);
-      res.end();
-    });
-  });
-  async function route(req: IncomingMessage, res: ServerResponse) {
-    const url = URL.parse(req.url ?? '/', 'http://localhost');
-    if (!url) {
-      res.writeHead(400).end();
-      return;
-    }
-
-    if (url.pathname === '/health' && req.method === 'GET') {
+    // Health checks from the container need no public Host header.
+    if (req.url === '/health' && req.method === 'GET') {
       res.writeHead(200).end('ok');
       return;
     }
-    // Protected resource metadata (RFC 9728). Served unauthenticated and
-    // without the loopback Host/Origin guards so external MCP clients can
-    // discover the authorization server. Only present in auth mode.
-    if (url.pathname === '/.well-known/oauth-protected-resource') {
-      if (!auth) {
-        res.writeHead(404).end();
-        return;
-      }
-      res.writeHead(200, {
-        'content-type': 'application/json',
-        'access-control-allow-origin': '*',
-        'cache-control': 'no-store',
-      });
-      res.end(
-        JSON.stringify({
-          resource: resourceUrl,
-          authorization_servers: auth.authorizationServers,
-          scopes_supported: [...SPOTIFY_SCOPES],
-        }),
-      );
-      return;
-    }
-
     if (!guards.every((guard) => guard(req, res))) return;
-    if (webAuth && (await webAuth(req, res, url))) return;
     if (
-      apiToken &&
-      !matchesSecret(req.headers.authorization ?? '', `Bearer ${apiToken}`)
+      req.url?.split('?')[0] === '/mcp' &&
+      req.headers.origin &&
+      req.headers.origin !== runtime.baseURL
     ) {
-      res
-        .writeHead(401, { 'WWW-Authenticate': 'Bearer realm="spotify-mcp"' })
-        .end('Unauthorized');
+      res.writeHead(403).end('Invalid origin');
       return;
     }
-    if (url.pathname !== '/mcp') {
-      res.writeHead(404).end();
-      return;
-    }
-
-    if (auth) {
-      const header = req.headers.authorization ?? '';
-      const match = /^Bearer (.+)$/.exec(header);
-      if (!match?.[1]) {
-        res.writeHead(401, {
-          'WWW-Authenticate': `Bearer realm="spotify", resource_metadata="${resourceMetadataUrl()}"`,
-        });
-        res.end('Unauthorized');
-        return;
-      }
-      // The Bearer token is a valid Spotify access token issued to the
-      // MCP client by the authorization server; use it for this request's
-      // Spotify API calls and keep it out of the local config file.
-      void (async () => {
-        let tokenError: unknown;
-        try {
-          await ensureTokenValid(match[1]);
-        } catch (error) {
-          tokenError = error;
-        }
-        if (tokenError) {
-          let status: number = 502;
-          if (
-            tokenError instanceof Error &&
-            'status' in tokenError &&
-            typeof tokenError.status === 'number'
-          ) {
-            status = tokenError.status === 401 ? 401 : 502;
-          }
-          res.writeHead(status, {
-            'WWW-Authenticate': `Bearer realm="spotify", error="${
-              status === 401 ? 'invalid_token' : 'server_error'
-            }", resource_metadata="${resourceMetadataUrl()}"`,
-          });
-          res.end('Unauthorized');
-          return;
-        }
-        withSpotifyRequestToken(match[1], () => void handle(req, res));
-      })();
-      return;
-    }
-
     void handle(req, res);
-  }
-
+  });
   server.once('listening', () => {
     const bound = server.address();
-    const boundPort = typeof bound === 'object' && bound ? bound.port : port;
-    if (typeof bound === 'object' && bound && isLoopbackAddress(bound.address))
-      guards = loopbackGuards(host, bound.address);
-    if (auth) {
-      // An explicitly configured SPOTIFY_RESOURCE_URL always wins (Docker
-      // service name, reverse-proxy URL). Otherwise derive it from the
-      // configured host and the *bound* port.
-      resourceUrl =
-        auth.explicitResourceUrl ?? `http://${formatHost(host)}:${boundPort}`;
+    if (
+      typeof bound === 'object' &&
+      bound &&
+      isLoopbackAddress(bound.address)
+    ) {
+      guards = [
+        hostHeaderValidation([
+          publicHostname,
+          'localhost',
+          '127.0.0.1',
+          '[::1]',
+        ]),
+      ];
     }
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, host, resolve);
-  });
-  return server;
-}
-
-/**
- * Validates Bearer tokens lazily: the first request of each distinct token
- * (i.e. token rotation by the MCP client) triggers a Spotify /me ping;
- * validated tokens are memoised so steady-state requests add no latency.
- * The ping is skipped entirely under test mocking of global fetch.
- */
-const validatedTokens = new Set<string>();
-
-// A token is not trusted forever: the moment Spotify answers 401 for a
-// tool call that already passed validation (expiry or revocation mid-
-// session), the token is evicted here (via setSpotifyTokenRejectedHook
-// from utils.ts), the next request re-runs the /me ping, and a token
-// Spotify still rejects gets 401 invalid_token at the transport level
-// instead of a tool-level error.
-setSpotifyTokenRejectedHook((token) => validatedTokens.delete(token));
-
-export function resetTokenValidationCache(): void {
-  validatedTokens.clear();
-}
-
-async function ensureTokenValid(token: string): Promise<void> {
-  if (validatedTokens.has(token)) return;
-  await validateSpotifyToken(token);
-  validatedTokens.add(token);
+  if (!suppliedRuntime) server.once('close', () => runtime.database.close());
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, host, resolve);
+    });
+    return server;
+  } catch (error) {
+    if (!suppliedRuntime) runtime.database.close();
+    throw error;
+  }
 }

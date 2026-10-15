@@ -4,6 +4,7 @@ import type {
   ServerContext,
 } from '@modelcontextprotocol/server';
 import { z } from 'zod';
+import { bindSpotifyAccount } from './request-context.js';
 
 // Spotify IDs are base62. Some are interpolated straight into API paths, so
 // reject anything that could change the path or query (`/`, `.`, `?`, `#`, `%`).
@@ -30,7 +31,7 @@ export function defineTool<Args extends z.ZodRawShape>(definition: {
           description: definition.description,
           inputSchema: z.object(definition.schema),
         },
-        definition.handler,
+        bindSpotifyAccount(definition.handler),
       );
     },
   };
