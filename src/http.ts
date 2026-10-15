@@ -20,6 +20,7 @@ import {
   setSpotifyTokenRejectedHook,
   validateSpotifyToken,
 } from './utils.js';
+import { createWebAuth, matchesSecret } from './web-auth.js';
 
 export interface HttpOptions {
   host: string;
@@ -97,6 +98,20 @@ export async function serveHttp(
   { host, port }: HttpOptions,
   auth?: AuthOptions,
 ): Promise<Server> {
+  const apiToken = process.env.MCP_API_TOKEN;
+  if (process.env.MCP_AUTH === 'token' && !apiToken)
+    throw new Error('MCP_API_TOKEN is required.');
+  if (apiToken && auth)
+    throw new Error('Choose MCP_AUTH=token or MCP_AUTH=spotify, not both.');
+  if (
+    !(apiToken || auth || isLoopbackAddress(host)) &&
+    host.toLowerCase().replace(/\.$/, '') !== 'localhost'
+  ) {
+    throw new Error('Remote HTTP requires MCP_API_TOKEN or MCP_AUTH=spotify.');
+  }
+  if (apiToken && apiToken.length < 32)
+    throw new Error('MCP_API_TOKEN must contain at least 32 characters.');
+  const webAuth = apiToken ? createWebAuth(apiToken) : undefined;
   const onerror = (error: Error) => console.error('MCP HTTP error:', error);
   const handle = toNodeHandler(createMcpHandler(factory, { onerror }), {
     onerror,
@@ -113,12 +128,22 @@ export async function serveHttp(
     `${resourceUrl}/.well-known/oauth-protected-resource`;
 
   const server = createHttpServer((req, res) => {
+    void route(req, res).catch(() => {
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    });
+  });
+  async function route(req: IncomingMessage, res: ServerResponse) {
     const url = URL.parse(req.url ?? '/', 'http://localhost');
     if (!url) {
       res.writeHead(400).end();
       return;
     }
 
+    if (url.pathname === '/health' && req.method === 'GET') {
+      res.writeHead(200).end('ok');
+      return;
+    }
     // Protected resource metadata (RFC 9728). Served unauthenticated and
     // without the loopback Host/Origin guards so external MCP clients can
     // discover the authorization server. Only present in auth mode.
@@ -143,6 +168,16 @@ export async function serveHttp(
     }
 
     if (!guards.every((guard) => guard(req, res))) return;
+    if (webAuth && (await webAuth(req, res, url))) return;
+    if (
+      apiToken &&
+      !matchesSecret(req.headers.authorization ?? '', `Bearer ${apiToken}`)
+    ) {
+      res
+        .writeHead(401, { 'WWW-Authenticate': 'Bearer realm="spotify-mcp"' })
+        .end('Unauthorized');
+      return;
+    }
     if (url.pathname !== '/mcp') {
       res.writeHead(404).end();
       return;
@@ -191,7 +226,7 @@ export async function serveHttp(
     }
 
     void handle(req, res);
-  });
+  }
 
   server.once('listening', () => {
     const bound = server.address();

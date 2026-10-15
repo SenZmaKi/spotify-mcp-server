@@ -8,7 +8,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
  * refresh token.
  *
  * stdio mode (no auth layer) leaves the storage empty; code falls back to
- * the legacy spotify-config.json flow.
+ * the environment configuration and persisted Spotify token flow.
  */
 const tokenStorage = new AsyncLocalStorage<string | null>();
 

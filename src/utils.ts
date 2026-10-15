@@ -1,15 +1,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import http from 'node:http';
 import path from 'node:path';
-import readline from 'node:readline';
-import { fileURLToPath, URL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { SpotifyApi } from '@spotify/web-api-ts-sdk';
-import open from 'open';
 import { getSpotifyRequestToken } from './request-context.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_FILE = path.join(__dirname, '../spotify-config.json');
+const CONFIG_FILE = path.join(__dirname, '../spotify-tokens.json');
 
 /**
  * The full scope set the tool surface actually needs. Used by the local
@@ -63,27 +60,26 @@ export interface SpotifyConfig {
 }
 
 export function loadSpotifyConfig(): SpotifyConfig {
-  if (!fs.existsSync(CONFIG_FILE)) {
+  const clientId = process.env.SPOTIFY_CLIENT_ID;
+  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+  const redirectUri = process.env.SPOTIFY_REDIRECT_URI;
+  if (!(clientId && clientSecret && redirectUri)) {
     throw new Error(
-      `Spotify configuration file not found at ${CONFIG_FILE}. Please create one with clientId, clientSecret, and redirectUri.`,
+      'Set SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, and SPOTIFY_REDIRECT_URI.',
     );
   }
-
-  try {
-    const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    if (!(config.clientId && config.clientSecret && config.redirectUri)) {
-      throw new Error(
-        'Spotify configuration must include clientId, clientSecret, and redirectUri.',
-      );
-    }
-    return config;
-  } catch (error) {
-    throw new Error(
-      `Failed to parse Spotify configuration: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-  }
+  const file = process.env.SPOTIFY_TOKEN_FILE || CONFIG_FILE;
+  const tokens = fs.existsSync(file)
+    ? JSON.parse(fs.readFileSync(file, 'utf8'))
+    : {};
+  return {
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    expiresAt: tokens.expiresAt,
+    clientId,
+    clientSecret,
+    redirectUri,
+  };
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -141,7 +137,21 @@ export function writeFileAtomic(file: string, data: string): void {
 }
 
 export function saveSpotifyConfig(config: SpotifyConfig): void {
-  writeFileAtomic(CONFIG_FILE, JSON.stringify(config, null, 2));
+  const file = process.env.SPOTIFY_TOKEN_FILE || CONFIG_FILE;
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  writeFileAtomic(
+    file,
+    JSON.stringify(
+      {
+        accessToken: config.accessToken,
+        refreshToken: config.refreshToken,
+        expiresAt: config.expiresAt,
+      },
+      null,
+      2,
+    ),
+  );
+  fs.chmodSync(file, 0o600);
 }
 
 let cachedSpotifyApi: SpotifyApi | null = null;
@@ -212,7 +222,7 @@ export async function spotifyFetch<T = unknown>(
   const accessToken = bearerToken ?? config?.accessToken;
   if (!accessToken) {
     throw new Error(
-      'No access token available. Run "npm run auth" to authenticate.',
+      'No access token available. Run "open the server web UI" to authenticate.',
     );
   }
 
@@ -304,7 +314,7 @@ export async function createSpotifyApi(): Promise<SpotifyApi> {
     } catch (error) {
       console.error('Failed to refresh token:', error);
       throw new Error(
-        'Failed to refresh access token. Please run "npm run auth" to re-authenticate.',
+        'Failed to refresh access token. Please run "open the server web UI" to re-authenticate.',
       );
     }
   }
@@ -329,37 +339,20 @@ export async function createSpotifyApi(): Promise<SpotifyApi> {
     return cachedSpotifyApi;
   }
 
-  // Fallback to client credentials if no user tokens available
-  cachedSpotifyApi = SpotifyApi.withClientCredentials(
-    config.clientId,
-    config.clientSecret,
+  throw new Error(
+    'Spotify is not connected. Open the server web UI to connect your account.',
   );
-  cachedAccessToken = null;
-
-  return cachedSpotifyApi;
 }
 
 function hashToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-function generateRandomString(length: number): string {
-  const array = new Uint8Array(length);
-  crypto.getRandomValues(array);
-  return Array.from(array)
-    .map((b) =>
-      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.charAt(
-        b % 62,
-      ),
-    )
-    .join('');
-}
-
 function base64Encode(str: string): string {
   return Buffer.from(str).toString('base64');
 }
 
-async function exchangeCodeForToken(
+export async function exchangeCodeForToken(
   code: string,
   config: SpotifyConfig,
 ): Promise<{
@@ -438,7 +431,7 @@ async function refreshAccessToken(
       config.expiresAt = undefined;
       saveSpotifyConfig(config);
       throw new Error(
-        'Spotify refresh token is no longer valid (invalid_grant) and has been discarded. Please run "npm run auth" to re-authenticate.',
+        'Spotify refresh token is no longer valid (invalid_grant) and has been discarded. Please run "open the server web UI" to re-authenticate.',
       );
     }
 
@@ -459,201 +452,6 @@ async function refreshAccessToken(
   };
 }
 
-export async function authorizeSpotify(): Promise<void> {
-  const config = loadSpotifyConfig();
-
-  const redirectUri = new URL(config.redirectUri);
-  if (
-    redirectUri.hostname !== 'localhost' &&
-    redirectUri.hostname !== '127.0.0.1'
-  ) {
-    console.error(
-      'Error: Redirect URI must use localhost for automatic token exchange',
-    );
-    console.error(
-      'Please update your spotify-config.json with a localhost redirect URI',
-    );
-    console.error('Example: http://127.0.0.1:8888/callback');
-    process.exit(1);
-  }
-
-  const port = redirectUri.port || '80';
-  const callbackPath = redirectUri.pathname || '/callback';
-
-  const state = generateRandomString(16);
-
-  const authParams = new URLSearchParams({
-    client_id: config.clientId,
-    response_type: 'code',
-    redirect_uri: config.redirectUri,
-    scope: SPOTIFY_SCOPES.join(' '),
-    state: state,
-    show_dialog: 'true',
-  });
-
-  const authorizationUrl = `https://accounts.spotify.com/authorize?${authParams.toString()}`;
-
-  const authPromise = new Promise<void>((resolve, reject) => {
-    // Create HTTP server to handle the callback
-    const server = http.createServer(async (req, res) => {
-      if (!req.url) {
-        return res.end('No URL provided');
-      }
-
-      const reqUrl = new URL(req.url, `http://localhost:${port}`);
-
-      if (reqUrl.pathname === callbackPath) {
-        const code = reqUrl.searchParams.get('code');
-        const returnedState = reqUrl.searchParams.get('state');
-        const error = reqUrl.searchParams.get('error');
-
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-
-        if (error) {
-          console.error(`Authorization error: ${error}`);
-          res.end(
-            '<html><body><h1>Authentication Failed</h1><p>Please close this window and try again.</p></body></html>',
-          );
-          server.close();
-          reject(new Error(`Authorization failed: ${error}`));
-          return;
-        }
-
-        if (returnedState !== state) {
-          console.error('State mismatch error');
-          res.end(
-            '<html><body><h1>Authentication Failed</h1><p>State verification failed. Please close this window and try again.</p></body></html>',
-          );
-          server.close();
-          reject(new Error('State mismatch'));
-          return;
-        }
-
-        if (!code) {
-          console.error('No authorization code received');
-          res.end(
-            '<html><body><h1>Authentication Failed</h1><p>No authorization code received. Please close this window and try again.</p></body></html>',
-          );
-          server.close();
-          reject(new Error('No authorization code received'));
-          return;
-        }
-
-        try {
-          const tokens = await exchangeCodeForToken(code, config);
-
-          config.accessToken = tokens.access_token;
-          config.refreshToken = tokens.refresh_token;
-          config.expiresAt = Date.now() + tokens.expires_in * 1000; // Convert seconds to milliseconds
-          saveSpotifyConfig(config);
-
-          res.end(
-            '<html><body><h1>Authentication Successful!</h1><p>You can now close this window and return to the application.</p></body></html>',
-          );
-          console.log(
-            'Authentication successful! Access token has been saved.',
-          );
-
-          server.close();
-          resolve();
-        } catch (error) {
-          console.error('Token exchange error:', error);
-          res.end(
-            '<html><body><h1>Authentication Failed</h1><p>Failed to exchange authorization code for tokens. Please close this window and try again.</p></body></html>',
-          );
-          server.close();
-          reject(error);
-        }
-      } else {
-        res.writeHead(404);
-        res.end();
-      }
-    });
-
-    server.listen(Number.parseInt(port, 10), '127.0.0.1', () => {
-      console.log(
-        `Listening for Spotify authentication callback on port ${port}`,
-      );
-      console.log('Opening browser for authorization...');
-      console.log('');
-      console.log('If no browser opens, visit this URL manually:');
-      console.log(authorizationUrl);
-      console.log('');
-
-      open(authorizationUrl).catch(async (_error: Error) => {
-        console.log('Failed to open browser automatically.');
-        console.log('Please visit this URL to authorize:');
-        console.log(authorizationUrl);
-        console.log('');
-        console.log('After authorization, you will be redirected to:');
-        console.log(config.redirectUri);
-        console.log('Please paste the full redirect URL here:');
-
-        const rl = readline.createInterface({
-          input: process.stdin,
-          output: process.stdout,
-        });
-
-        const redirectUrl = await new Promise<string>((resolve) => {
-          rl.question('Redirect URL: ', (url) => {
-            rl.close();
-            resolve(url);
-          });
-        });
-
-        try {
-          const reqUrl = new URL(redirectUrl);
-          const code = reqUrl.searchParams.get('code');
-          const returnedState = reqUrl.searchParams.get('state');
-          const error = reqUrl.searchParams.get('error');
-
-          if (error) {
-            throw new Error(`Authorization error: ${error}`);
-          }
-
-          if (returnedState !== state) {
-            throw new Error('State mismatch');
-          }
-
-          if (!code) {
-            throw new Error('No authorization code received');
-          }
-
-          const tokens = await exchangeCodeForToken(code, config);
-          config.accessToken = tokens.access_token;
-          config.refreshToken = tokens.refresh_token;
-          config.expiresAt = Date.now() + tokens.expires_in * 1000;
-          saveSpotifyConfig(config);
-          console.log(
-            'Authentication successful! Access token has been saved.',
-          );
-          server.close();
-          resolve();
-        } catch (error) {
-          server.close();
-          reject(error);
-        }
-      });
-    });
-
-    server.on('error', (error) => {
-      console.error(`Server error: ${error.message}`);
-      reject(error);
-    });
-  });
-
-  await authPromise;
-}
-
-/**
- * Checks that a Bearer token is a valid Spotify access token by calling the
- * /me endpoint. Spotify issues opaque tokens without a JWKS, so audience
- * checks are not possible — this ping is the strongest validation available
- * without the client secret. It is used lazily by the HTTP transport only
- * when a new token first appears (token rotation), not per request.
- *
- * @throws an Error with status 401 if the token is rejected by Spotify.
- */
 export async function validateSpotifyToken(accessToken: string): Promise<void> {
   const response = await fetch('https://api.spotify.com/v1/me', {
     method: 'GET',

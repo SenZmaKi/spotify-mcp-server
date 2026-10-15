@@ -6,10 +6,16 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { createServer } from '../build/server.js';
 
 export const configPath = fileURLToPath(
-  new URL('../spotify-config.json', import.meta.url),
+  new URL('../spotify-tokens.json', import.meta.url),
 );
 
 export function mockConfig(t, overrides = {}) {
+  setEnv(t, {
+    SPOTIFY_CLIENT_ID: 'test-client',
+    SPOTIFY_CLIENT_SECRET: 'test-secret',
+    SPOTIFY_REDIRECT_URI: 'http://127.0.0.1:8888/callback',
+  });
+  t.mock.method(fs, 'chmodSync', () => {});
   let config = {
     clientId: 'test-client',
     clientSecret: 'test-secret',
@@ -132,4 +138,16 @@ export function resultText(result) {
       return item.text;
     })
     .join('\n');
+}
+
+export function setEnv(t, values) {
+  for (const [key, value] of Object.entries(values)) {
+    const previous = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+    t.after(() => {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    });
+  }
 }

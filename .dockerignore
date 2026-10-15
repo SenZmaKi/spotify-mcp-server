@@ -26,3 +26,8 @@ spotify-config.json
 Dockerfile
 docker-compose.yml
 .env.example
+
+.env.*
+!.env.example
+spotify-tokens.json
+data/

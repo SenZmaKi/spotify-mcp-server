@@ -178,7 +178,15 @@ for (const host of [
   '::ffff:127.0.0.1',
 ]) {
   test(`loopback alias bind ${host} keeps the Host and Origin guards`, async (t) => {
-    const { address, port } = await listen(t, host);
+    let bound;
+    try {
+      bound = await listen(t, host);
+    } catch (error) {
+      if (error.code !== 'EADDRNOTAVAIL') throw error;
+      t.skip(`Loopback alias ${host} is not configured on this host`);
+      return;
+    }
+    const { address, port } = bound;
     assert.equal(await post(address, port, { host: 'evil.example' }), 403);
     assert.equal(
       await post(address, port, { origin: 'https://evil.example' }),

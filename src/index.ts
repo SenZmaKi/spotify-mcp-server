@@ -30,7 +30,7 @@ if (http) {
   // Auth mode (MCP_AUTH=spotify): MCP clients (e.g. MCPHub) perform the
   // Spotify OAuth flow themselves and present the resulting access token as
   // Bearer. The token is used per request and never written to
-  // spotify-config.json. serveHttp resolves the protected-resource address
+  // the Spotify token file. serveHttp resolves the protected-resource address
   // once the socket binds (bound port) so metadata and 401 challenges agree.
   const auth = authOptionsFromEnv();
   const server = await serveHttp(createServer, http, auth);

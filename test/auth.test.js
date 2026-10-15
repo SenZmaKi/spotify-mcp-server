@@ -51,7 +51,7 @@ test('revoked refresh tokens are discarded and request reauthentication', async 
   ]);
   await assert.rejects(
     spotifyFetch('me/player/devices'),
-    /invalid_grant.*npm run auth/,
+    /invalid_grant.*web UI/,
   );
   assert.equal(config().accessToken, undefined);
   assert.equal(config().refreshToken, undefined);

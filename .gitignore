@@ -5,3 +5,8 @@ spotify-config.json
 build
 dist
 .DS_Store
+
+.env.*
+!.env.example
+spotify-tokens.json
+data/

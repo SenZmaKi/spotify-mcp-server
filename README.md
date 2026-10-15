@@ -5,26 +5,7 @@
 
 A lightweight [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that enables AI assistants like Cursor & Claude to control Spotify playback and manage playlists.
 
-<details>
-<summary>Contents</summary>
 
-- [Example Interactions](#example-interactions)
-- [Tools](#tools)
-  - [Read Operations](#read-operations)
-  - [Album Operations](#album-operations)
-  - [Play / Create Operations](#play--create-operations)
-  - [Playlist Operations](#playlist-operations)
-- [Setup](#setup)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Creating a Spotify Developer Application](#creating-a-spotify-developer-application)
-  - [Spotify API Configuration](#spotify-api-configuration)
-  - [Authentication Process](#authentication-process)
-- [Integrating with Claude Desktop, Cursor, and VsCode (Cline)](#integrating-with-claude-desktop-and-cursor)
-  - [Streamable HTTP](#streamable-http)
-  - [OAuth (MCPHub and other OAuth-capable clients)](#oauth-mcphub-and-other-oauth-capable-clients)
-  - [Docker (recommended for MCPHub)](#docker-recommended-for-mcphub)
-</details>
 
 ## Example Interactions
 
@@ -305,288 +286,134 @@ A lightweight [Model Context Protocol (MCP)](https://modelcontextprotocol.io) se
 
 ## Setup
 
-### Prerequisites
+Run one instance on your server behind an HTTPS reverse proxy. MCP clients use
+Streamable HTTP at `https://spotify.example.com/mcp` and send:
 
-- Latest Node.js Current release (currently v26.8.1; older release lines are unsupported)
-- A Spotify Premium account
-- A registered Spotify Developer application
+```http
+Authorization: Bearer YOUR_MCP_API_TOKEN
+```
 
-### Installation
+The MCP token is your own secret, not a Spotify token. It grants access to all
+Spotify tools. Clients must support custom authorization headers. Change the
+server token and restart to revoke access; update each client afterwards.
+
+### Spotify app
+
+1. Sign in at https://developer.spotify.com/dashboard and create an app using
+   the Web API. Copy its client ID and client secret into your server environment.
+2. Register exactly `https://spotify.example.com/callback` as a redirect URI,
+   substituting your actual domain. Set `SPOTIFY_REDIRECT_URI` to the same value.
+3. For local development, register `http://127.0.0.1:3000/callback` instead.
+   Spotify requires HTTPS except for literal loopback IP addresses; do not use
+   `localhost`. See [Spotify redirect rules](https://developer.spotify.com/documentation/web-api/concepts/redirect_uri).
+4. Use a Spotify Premium account. Check your app's User Management settings and
+   allowlist your account if required by Development Mode.
+5. Optionally set `SPOTIFY_USER_ID` to your Spotify account ID to reject connections
+   to other accounts. This is the ID in your Spotify profile URL, not your display name.
+
+Separate apps named Spotify MCP Dev and Spotify MCP Prod are recommended to
+isolate credentials and revocation, but one app can have both redirect URIs.
+Hosting on Hetzner does not require Spotify extended quota mode: a personal
+single-user deployment can remain in Development Mode, subject to Spotify's
+[current eligibility and limits](https://developer.spotify.com/documentation/web-api/concepts/quota-modes).
+Use different MCP tokens and token files/volumes for each environment regardless.
+
+### Hetzner / Docker
+
+Copy `.env.example` to `.env`, fill in the Spotify values, and generate a secret:
 
 ```bash
-git clone https://github.com/marcelmarais/spotify-mcp-server.git
-cd spotify-mcp-server
+openssl rand -hex 32
+```
+
+Set that result as `MCP_API_TOKEN`, then run:
+
+```bash
+docker compose up -d --build
+```
+
+Configure your reverse proxy to forward your HTTPS domain to
+`127.0.0.1:3000`, including the Authorization header and streaming responses.
+If your proxy runs in another container, join a shared Docker network and forward
+to `spotify-mcp:3000` instead. Only the HTTPS proxy should be publicly exposed.
+The `/health` endpoint is a process health check, not a Spotify connectivity check.
+
+Open `https://spotify.example.com/`, enter your MCP token in the password field,
+and click Connect Spotify. Authorize Spotify in the browser. No `npm run auth`
+or local callback server is needed. The browser sends the secret in a POST body,
+never in the URL; it is not stored in a browser session. Login state expires after
+10 minutes and is discarded on server restart. Start again if interrupted.
+
+Spotify access/refresh tokens are saved in `/app/data/spotify-tokens.json` on the
+Docker volume, with owner-only permissions and atomic replacement. Client ID and
+secret come exclusively from environment variables; `spotify-config.json` is no
+longer read. Tokens refresh automatically. Reconnect through the website if
+Spotify revokes authorization. Run one replica against the token file.
+Do not delete the volume unless you intend to reconnect Spotify.
+
+### Dokploy CI/CD
+
+The GitHub Actions workflow runs lint, type checking, and tests before building
+and pushing a `linux/amd64` image to `ghcr.io/senzmaki/spotify-mcp-server` with
+`latest` and commit tags. Pushes to `main` and manual workflow runs on `main`
+then trigger Dokploy through `SenZmaKi/dokploy-sentry`, which waits for deployment
+completion. Pull requests run checks only.
+
+Repository Actions secrets:
+
+- `DOKPLOY_URL`: `https://dokploy.phidel.dev`
+- `DOKPLOY_API_KEY`: configured directly in GitHub Secrets, never in this repo
+- `DOKPLOY_APP_ID`: the Spotify MCP `server` application's ID
+
+The configured Dokploy project is **Spotify MCP**, environment **production**,
+application **server**. It pulls `ghcr.io/senzmaki/spotify-mcp-server:latest`, runs
+one replica, mounts the `spotify-mcp-data` volume at `/app/data`, and checks
+`/health`. Its HTTPS domain is `spotify-mcp.phidel.dev` on container port 3000.
+Dokploy routes directly to the application; it does not use the local Compose
+file or its host port mapping.
+
+Before the first deployment:
+
+1. Point DNS for `spotify-mcp.phidel.dev` to your Dokploy server and remove
+   conflicting A/AAAA records. Dokploy manages the Let's Encrypt certificate.
+2. In the application's Environment settings, fill in `SPOTIFY_CLIENT_ID` and
+   `SPOTIFY_CLIENT_SECRET`. The callback is already configured as
+   `https://spotify-mcp.phidel.dev/callback`; register that exact URI with Spotify.
+   Optionally fill in `SPOTIFY_USER_ID`.
+3. `MCP_API_TOKEN` was generated directly in Dokploy. Retrieve it from the
+   application's Environment settings for the website and MCP client settings.
+4. Ensure the GHCR package is public after its first publication, or configure
+   Dokploy's Docker provider with registry credentials granting `read:packages`.
+   A public GitHub repository does not automatically make a new GHCR package public.
+5. Push the changes to `main` to run CI/CD. If the initial deployment cannot pull
+   the image, fix package access and rerun the deployment job. Open the website
+   and connect Spotify once the application is running.
+
+Spotify and MCP credentials belong in the Dokploy runtime environment, not in
+Docker build arguments or GitHub workflow source. Preserve the token volume
+across redeployments.
+
+### Local development
+
+Use a separate `.env.dev` with the same variables, setting:
+
+```dotenv
+MCP_HTTP_HOST=127.0.0.1
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:3000/callback
+SPOTIFY_TOKEN_FILE=./data/dev-tokens.json
+```
+
+```bash
 npm ci
 npm run build
+node --env-file=.env.dev build/index.js
 ```
 
-### Creating a Spotify Developer Application
-
-1. Go to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard/)
-2. Log in with your Spotify account
-3. Click the "Create an App" button
-4. Fill in the app name and description
-5. Accept the Terms of Service and click "Create"
-6. In your new app's dashboard, you'll see your **Client ID**
-7. Click "Show Client Secret" to reveal your **Client Secret**
-8. Click "Edit Settings" and add a Redirect URI (e.g., `http://127.0.0.1:8888/callback`)
-9. Save your changes
-
-### Spotify API Configuration
-
-Create a `spotify-config.json` file in the project root (you can copy and modify the provided example):
-
-```bash
-# Copy the example config file
-cp spotify-config.example.json spotify-config.json
-```
-
-Then edit the file with your credentials:
-
-```json
-{
-  "clientId": "your-client-id",
-  "clientSecret": "your-client-secret",
-  "redirectUri": "http://127.0.0.1:8888/callback"
-}
-```
-
-### Authentication Process
-
-The Spotify API uses OAuth 2.0 for authentication. Follow these steps to authenticate your application:
-
-1. Run the authentication script:
-
-```bash
-npm run auth
-```
-
-2. The script will generate an authorization URL. Open this URL in your web browser.
-
-3. You'll be prompted to log in to Spotify and authorize your application.
-
-4. After authorization, Spotify will redirect you to your specified redirect URI with a code parameter in the URL.
-
-5. The authentication script will automatically exchange this code for access and refresh tokens.
-
-6. These tokens will be saved to your `spotify-config.json` file, which will now look something like:
-
-```json
-{
-  "clientId": "your-client-id",
-  "clientSecret": "your-client-secret",
-  "redirectUri": "http://localhost:8888/callback",
-  "accessToken": "BQAi9Pn...kKQ",
-  "refreshToken": "AQDQcj...7w",
-  "expiresAt": 1677889354671
-}
-```
-
-**Note**: The `expiresAt` field is a Unix timestamp (in milliseconds) indicating when the access token expires.
-
-7. **Automatic Token Refresh**: The server will automatically refresh the access token when it expires (typically after 1 hour). The refresh happens transparently using the `refreshToken`, so you don't need to re-authenticate manually. If the refresh fails, you'll need to run `npm run auth` again to re-authenticate.
-
-## Integrating with Claude Desktop, Cursor, and VsCode [Via Cline model extension](https://marketplace.visualstudio.com/items/?itemName=saoudrizwan.claude-dev)
-
-To use your MCP server with Claude Desktop, add it to your Claude configuration:
-
-```json
-{
-  "mcpServers": {
-    "spotify": {
-      "command": "node",
-      "args": ["spotify-mcp-server/build/index.js"]
-    }
-  }
-}
-```
-
-For Cursor, go to the MCP tab in `Cursor Settings` (command + shift + J). Add a server with this command:
-
-```bash
-node path/to/spotify-mcp-server/build/index.js
-```
-
-To set up your MCP correctly with Cline ensure you have the following file configuration set `cline_mcp_settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "spotify": {
-      "command": "node",
-      "args": ["~/../spotify-mcp-server/build/index.js"],
-      "autoApprove": ["getListeningHistory", "getNowPlaying"]
-    }
-  }
-}
-```
-
-You can add additional tools to the auto approval array to run the tools without intervention.
-
-### Streamable HTTP
-
-The server uses stdio by default. To run one long-lived process that several MCP clients connect to over HTTP instead, set `MCP_TRANSPORT=http`:
-
-```bash
-MCP_TRANSPORT=http MCP_HTTP_PORT=3000 node path/to/spotify-mcp-server/build/index.js
-```
-
-Clients then connect to `http://127.0.0.1:3000/mcp`. `MCP_HTTP_PORT` defaults to `3000` and `MCP_HTTP_HOST` to `127.0.0.1`. On a loopback address, requests whose `Host` or `Origin` header names anything other than `localhost`, `127.0.0.1`, `[::1]`, `MCP_HTTP_HOST` or the bound address are rejected to prevent DNS rebinding. The endpoint has no authentication, so only bind another address behind something that provides it.
-
-### OAuth (MCPHub and other OAuth-capable clients)
-
-Set `MCP_AUTH=spotify` in addition to `MCP_TRANSPORT=http`. The server then acts as an OAuth-protected MCP endpoint (RFC 9728) whose authorization server is Spotify itself:
-
-```bash
-MCP_TRANSPORT=http MCP_HTTP_PORT=3000 MCP_AUTH=spotify node path/to/spotify-mcp-server/build/index.js
-```
-
-- `POST /mcp` without an `Authorization: Bearer` header returns `401` with a `WWW-Authenticate` challenge pointing at `/.well-known/oauth-protected-resource`.
-- That metadata document advertises `https://accounts.spotify.com` as the authorization server (plus the full required scope set under `scopes_supported`), so clients with OAuth support (e.g. MCPHub) discover Spotify, run the authorization-code flow in the browser, and reconnect with the issued access token.
-- The Bearer token is used **per request** as the Spotify access token and is never written to `spotify-config.json` — no `npm run auth`, no stored refresh token, no token-refresh timer. Token rotation by the client is handled transparently.
-- On the first request of each new token (i.e. on rotation) the server validates it against Spotify (`GET /me`) and memoises the result. If Spotify rejects the token the server answers `401` with `WWW-Authenticate: Bearer error="invalid_token"`, so the client knows to reauthorise. A token is **not trusted forever**: if Spotify later 401s a tool call with an already-validated token (expiry or revocation), the server evicts it from the validation memo, and the next request re-runs the `/me` ping instead of reusing the stale result. Spotify issues opaque tokens (no JWKS, no public introspection endpoint), so the `/me` ping is the strongest validation possible without the client secret — it proves the token works with Spotify, but cannot verify the token was issued for *this* app (that would require the client secret, which this mode deliberately does not hold).
-- `spotify-config.json` is not required in this mode. stdio mode is unchanged and still uses the config file.
-
-Environment variables:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `MCP_AUTH` | unset (stdio/config-file mode) | `spotify` enables Bearer-token auth on the HTTP transport |
-| `SPOTIFY_RESOURCE_URL` | derived from bind host/port | `resource` value in the protected-resource metadata. Set this to the public URL the MCP client uses when the server is reachable under a different address (reverse proxy, Docker port mapping). |
-| `SPOTIFY_AUTHORIZATION_SERVERS` | `https://accounts.spotify.com` | Comma-separated list of authorization server URLs in the metadata. |
-
-**One-time Spotify app setup** (same dashboard as for the other flows): add the redirect URI your MCP client uses for callbacks (e.g. `http://127.0.0.1:3000/oauth/callback` for a local MCPHub dashboard — Spotify rejects `localhost` redirect URIs for new apps, so use `127.0.0.1` or an HTTPS URL) and copy the **client ID** into the client's OAuth configuration. Spotify does not support dynamic client registration, so the client ID must be provided manually. The client secret is only needed by clients that exchange the code using `client_secret_basic`/`client_secret_post`.
-
-Request the **full scope set** advertised in the metadata's `scopes_supported` (15 scopes); if a client requests fewer, tools that need the missing scopes fail with `403`.
-
-Example MCPHub configuration:
-
-```json
-{
-  "mcpServers": {
-    "spotify": {
-      "type": "streamable-http",
-      "url": "http://127.0.0.1:3000/mcp",
-      "oauth": {
-        "clientId": "your-spotify-client-id",
-        "authorizationEndpoint": "https://accounts.spotify.com/authorize",
-        "tokenEndpoint": "https://accounts.spotify.com/api/token",
-        "redirectUri": "http://127.0.0.1:3000/oauth/callback",
-        "scopes": [
-          "user-read-private",
-          "user-read-email",
-          "user-read-playback-state",
-          "user-modify-playback-state",
-          "user-read-currently-playing",
-          "user-read-playback-position",
-          "playlist-read-private",
-          "playlist-read-collaborative",
-          "playlist-modify-private",
-          "playlist-modify-public",
-          "user-library-read",
-          "user-library-modify",
-          "user-read-recently-played",
-          "user-top-read",
-          "user-follow-read"
-        ],
-        "resource": "http://127.0.0.1:3000"
-      }
-    }
-  }
-}
-```
-
-### Docker (recommended for MCPHub)
-
-The repository ships a `Dockerfile` (multi-stage, `node:26-alpine`, unprivileged
-user) and a `docker-compose.yml` that run the server in **OAuth-protected
-Streamable HTTP mode** on an internal Docker network. No host port is published,
-so the server is not exposed on the host's external interfaces — only your
-MCPHub container (on the same Docker network) can reach it at
-`http://spotify-mcp:3000/mcp`. Only the MCPHub dashboard/callback URL needs to
-be publicly reachable, because Spotify's `redirect_uri` points at MCPHub.
-
-The image needs **no client secret, no refresh token and no `spotify-config.json`**.
-
-1. Build and start the server:
-
-   ```bash
-   docker compose up -d --build
-   ```
-
-2. In the Spotify Developer Dashboard, add the **MCPHub callback URL** as a
-   redirect URI for your app (e.g. `http://127.0.0.1:3000/oauth/callback` for a
-   local MCPHub — Spotify rejects `localhost` redirect URIs for new apps — or
-   your deployed MCPHub dashboard domain) and copy the **client ID**.
-
-3. Connect MCPHub to the server. Point `url` at the Docker DNS name and set
-   `resource` to the same value (this must match `SPOTIFY_RESOURCE_URL`, which
-   the server advertises in its protected-resource metadata):
-
-   ```json
-   {
-     "mcpServers": {
-       "spotify": {
-         "type": "streamable-http",
-         "url": "http://spotify-mcp:3000/mcp",
-         "oauth": {
-           "clientId": "your-spotify-client-id",
-           "authorizationEndpoint": "https://accounts.spotify.com/authorize",
-           "tokenEndpoint": "https://accounts.spotify.com/api/token",
-           "redirectUri": "http://127.0.0.1:3000/oauth/callback",
-           "scopes": [
-             "user-read-private",
-             "user-read-email",
-             "user-read-playback-state",
-             "user-modify-playback-state",
-             "user-read-currently-playing",
-             "user-read-playback-position",
-             "playlist-read-private",
-             "playlist-read-collaborative",
-             "playlist-modify-private",
-             "playlist-modify-public",
-             "user-library-read",
-             "user-library-modify",
-             "user-read-recently-played",
-             "user-top-read",
-             "user-follow-read"
-           ],
-           "resource": "http://spotify-mcp:3000"
-         }
-       }
-     }
-   }
-   ```
-
-   The two `spotify-mcp` containers must share a Docker network. If MCPHub
-   already runs in its own compose stack, join them: add the network to the
-   MCPHub service **and** declare the shared network `external: true` in
-   **both** compose files.
-
-   MCPHub service (`mcphub` compose file):
-
-   ```yaml
-   services:
-     mcphub:
-       networks:
-         - mcphub          # its own network (from its existing file)
-         - spotify-mcp     # join the Spotify MCP network
-   networks:
-     spotify-mcp:
-       external: true      # the network is created by the other stack
-   ```
-
-   Or, if you manage both yourself, create the network once with
-   `docker network create spotify-mcp` and mark it `external: true` in
-   **both** compose files — including this one's `spotify-mcp` network
-   definition — so neither stack tries to create it.
-
-4. In MCPHub, the first call triggers the Spotify authorization flow in the
-   browser; MCPHub stores the tokens and rotates them automatically.
-
-If MCPHub reaches the server through a different address (another host, a
-reverse proxy), set `SPOTIFY_RESOURCE_URL` in `.env` to that URL and mirror it
-in MCPHub's `oauth.resource`.
+Open `http://127.0.0.1:3000/` to connect. Environment files are loaded by Node's
+`--env-file` flag or Docker Compose, not automatically by the application.
+Legacy `MCP_AUTH=spotify` client-managed Spotify authentication remains available,
+but cannot be combined with `MCP_API_TOKEN`. The Docker default is token mode.
+Unauthenticated HTTP is restricted to loopback bindings.
 
 ## Development
 

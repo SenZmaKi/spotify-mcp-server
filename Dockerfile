@@ -30,21 +30,14 @@ COPY --from=build --chown=mcp:mcp /app/node_modules ./node_modules
 COPY --from=build --chown=mcp:mcp /app/build ./build
 COPY --chown=mcp:mcp package.json ./
 
+RUN mkdir -p /app/data && chown mcp:mcp /app/data
 USER mcp
 EXPOSE 3000
 
-# OAuth-protected Streamable HTTP mode:
-#   - 0.0.0.0 so other containers on the Docker network can reach it. No host
-#     port is published, so it is not exposed to the host's external
-#     interfaces.
-#   - MCP_AUTH=spotify makes the server an RFC 9728 protected resource whose
-#     authorization server is Spotify. The MCP client (e.g. MCPHub) performs
-#     the browser OAuth flow and presents the resulting access token as Bearer
-#     per request. This image therefore needs NO client secret, NO refresh
-#     token and NO spotify-config.json.
+# The HTTPS reverse proxy is responsible for TLS termination.
 ENV MCP_TRANSPORT=http \
     MCP_HTTP_HOST=0.0.0.0 \
     MCP_HTTP_PORT=3000 \
-    MCP_AUTH=spotify
+    MCP_AUTH=token
 
 CMD ["node", "build/index.js"]
